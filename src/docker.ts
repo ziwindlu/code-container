@@ -2,7 +2,7 @@ import { spawnSync } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import * as crypto from "crypto";
-import { printInfo, printError } from "./utils";
+import { printInfo, printError, printWarning } from "./utils";
 import { APPDATA_DIR, USER_DOCKERFILE_PATH } from "./config";
 import { loadMounts } from "./mounts";
 import { loadFlags, loadRunFlags } from "./flags";
@@ -67,16 +67,46 @@ export function ensureDockerfile(): void {
   }
 }
 
-export function buildImageRaw(): boolean {
-  const baseResult = spawnSync(
-    "docker",
-    ["build", "-t", `${BASE_IMAGE}:${IMAGE_TAG}`, "-f", PACKAGED_DOCKERFILE, APPDATA_DIR],
-    { stdio: "inherit" }
-  );
-  if (baseResult.status !== 0) return false;
+/**
+ * Extract FROM directive from Dockerfile
+ */
+function extractFromImage(dockerfilePath: string): string | null {
+  if (!fs.existsSync(dockerfilePath)) {
+    return null;
+  }
 
+  const content = fs.readFileSync(dockerfilePath, "utf-8");
+  const fromMatch = content.match(/^FROM\s+([^\s\n]+)/m);
+  return fromMatch ? fromMatch[1] : null;
+}
+
+export function buildImageRaw(): boolean {
   ensureDockerfile();
 
+  // Check if user Dockerfile extends our base image
+  const userFrom = extractFromImage(USER_DOCKERFILE_PATH);
+  const expectedBase = `${BASE_IMAGE}:${IMAGE_TAG}`;
+
+  if (userFrom === expectedBase) {
+    // User is extending base image - build it first
+    printInfo(`Building base image: ${expectedBase}`);
+    const baseResult = spawnSync(
+      "docker",
+      ["build", "-t", expectedBase, "-f", PACKAGED_DOCKERFILE, APPDATA_DIR],
+      { stdio: "inherit" }
+    );
+    if (baseResult.status !== 0) return false;
+  } else if (userFrom) {
+    // User is using a custom base image
+    printInfo(`Detected custom base image: ${userFrom}`);
+    printWarning(`Skipping base image build (${expectedBase} will not be used)`);
+    printWarning("Ensure your custom base image includes required tools (Claude Code, Node.js, etc.)");
+  } else {
+    // No FROM found - this is unusual but let it proceed
+    printWarning("Could not detect FROM directive in Dockerfile.User");
+  }
+
+  // Build user image
   const userResult = spawnSync(
     "docker",
     ["build", "-f", USER_DOCKERFILE_PATH, "-t", `${IMAGE_NAME}:${IMAGE_TAG}`, APPDATA_DIR],

@@ -100,6 +100,17 @@ export function buildImageRaw(): boolean {
     // User is using a custom base image
     printInfo(`Detected custom base image: ${userFrom}`);
     printWarning(`Skipping base image build (${expectedBase} will not be used)`);
+
+    // Check if this is a local image (not from Docker Hub)
+    const imageCheckResult = spawnSync("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"], { stdio: "pipe" });
+    const localImages = imageCheckResult.stdout.toString().trim().split("\n");
+    const isLocalImage = localImages.includes(userFrom);
+
+    if (isLocalImage) {
+      printInfo(`Local image detected: ${userFrom}`);
+      printWarning("Will use legacy builder (BuildKit disabled) to avoid registry lookup");
+    }
+
     printWarning("Ensure your custom base image includes required tools (Claude Code, Node.js, etc.)");
   } else {
     // No FROM found - this is unusual but let it proceed
@@ -107,11 +118,24 @@ export function buildImageRaw(): boolean {
   }
 
   // Build user image
-  const userResult = spawnSync(
-    "docker",
-    ["build", "-f", USER_DOCKERFILE_PATH, "-t", `${IMAGE_NAME}:${IMAGE_TAG}`, APPDATA_DIR],
-    { stdio: "inherit" }
-  );
+  // For local images, disable BuildKit to avoid registry lookup
+  const buildArgs = ["build", "-f", USER_DOCKERFILE_PATH, "-t", `${IMAGE_NAME}:${IMAGE_TAG}`, APPDATA_DIR];
+
+  // Check if we should use legacy builder for local images
+  if (userFrom && userFrom !== expectedBase) {
+    const imageCheckResult = spawnSync("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"], { stdio: "pipe" });
+    const localImages = imageCheckResult.stdout.toString().trim().split("\n");
+    const isLocalImage = localImages.includes(userFrom);
+
+    if (isLocalImage) {
+      // Use legacy builder for local images
+      const env = { ...process.env, DOCKER_BUILDKIT: "0" };
+      const userResult = spawnSync("docker", buildArgs, { stdio: "inherit", env });
+      return userResult.status === 0;
+    }
+  }
+
+  const userResult = spawnSync("docker", buildArgs, { stdio: "inherit" });
   return userResult.status === 0;
 }
 

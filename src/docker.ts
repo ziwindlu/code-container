@@ -3,9 +3,10 @@ import * as path from "path";
 import * as fs from "fs";
 import * as crypto from "crypto";
 import { printInfo, printError, printWarning } from "./utils";
-import { APPDATA_DIR, USER_DOCKERFILE_PATH } from "./config";
+import { APPDATA_DIR, USER_DOCKERFILE_PATH, isDryRun } from "./config";
 import { loadMounts } from "./mounts";
 import { loadFlags, loadRunFlags } from "./flags";
+import { getConfigDir } from "./config-loader";
 
 export const IMAGE_NAME = "code-container";
 export const IMAGE_TAG = "latest";
@@ -13,6 +14,17 @@ export const BASE_IMAGE = "code-container-base";
 const PACKAGED_DOCKERFILE = path.resolve(__dirname, "..", "Dockerfile");
 const PACKAGED_USER_DOCKERFILE = path.resolve(__dirname, "..", "Dockerfile.User");
 const CONTAINER_PREFIX = "container";
+
+function logDockerCommand(args: string[]): void {
+  const cmd = "docker " + args.map((arg) => {
+    // Quote arguments containing spaces
+    if (arg.includes(" ") || arg.includes("'") || arg.includes('"')) {
+      return `"${arg}"`;
+    }
+    return arg;
+  }).join(" ");
+  printInfo(`Running: ${cmd}`);
+}
 
 export function checkDocker(): void {
   const result = spawnSync("docker", ["info"], { stdio: "pipe" });
@@ -156,15 +168,33 @@ export function containerRunning(containerName: string): boolean {
 }
 
 export function stopContainer(containerName: string): void {
-  spawnSync("docker", ["stop", "--timeout", "3", containerName], { stdio: "inherit" });
+  const args = ["stop", containerName];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would stop container");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
 }
 
 export function startContainer(containerName: string): void {
-  spawnSync("docker", ["start", containerName], { stdio: "inherit" });
+  const args = ["start", containerName];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would start container");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
 }
 
 export function removeContainer(containerName: string): void {
-  spawnSync("docker", ["rm", containerName], { stdio: "inherit" });
+  const args = ["rm", containerName];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would remove container");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
 }
 
 export function createNewContainer(
@@ -192,6 +222,11 @@ export function createNewContainer(
 
   args.push(`${IMAGE_NAME}:${IMAGE_TAG}`, "sleep", "infinity");
 
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would create container");
+    return true;
+  }
   const result = spawnSync("docker", args, { stdio: "inherit" });
   return result.status === 0;
 }
@@ -201,23 +236,54 @@ export function execInteractive(
   projectName: string
 ): void {
   const flags = loadFlags();
-  spawnSync(
-    "docker",
-    [
-      "exec",
-      "-it",
-      "-e",
-      "TERM=xterm-256color",
-      "-e",
-      "COLORTERM=truecolor",
-      "-w",
-      `/root/${projectName}`,
-      ...flags,
-      containerName,
-      "/bin/bash",
-    ],
-    { stdio: "inherit" }
-  );
+  const args = [
+    "exec",
+    "-it",
+    "-e",
+    "TERM=xterm-256color",
+    "-e",
+    "COLORTERM=truecolor",
+    "-w",
+    `/root/${projectName}`,
+    ...flags,
+    containerName,
+    "/bin/bash",
+  ];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would execute interactive bash");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
+}
+
+export function execCommand(
+  containerName: string,
+  projectName: string,
+  command: string[]
+): void {
+  const flags = loadFlags();
+  const args = [
+    "exec",
+    // Use -i only if stdin is a TTY, -t only if stdout is a TTY
+    ...(process.stdin.isTTY ? ["-i"] : []),
+    ...(process.stdout.isTTY ? ["-t"] : []),
+    "-e",
+    "TERM=xterm-256color",
+    "-e",
+    "COLORTERM=truecolor",
+    "-w",
+    `/root/${projectName}`,
+    ...flags,
+    containerName,
+    ...command,
+  ];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would execute command");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
 }
 
 export function getOtherSessionCount(
@@ -262,34 +328,40 @@ export function stopContainerIfLastSession(
 }
 
 export function listContainersRaw(): void {
-  spawnSync(
-    "docker",
-    [
-      "ps",
-      "-a",
-      "--filter",
-      `name=${CONTAINER_PREFIX}-`,
-      "--format",
-      "table {{.Names}}\t{{.Status}}\t{{.CreatedAt}}",
-    ],
-    { stdio: "inherit" }
-  );
+  const args = [
+    "ps",
+    "-a",
+    "--filter",
+    `name=${CONTAINER_PREFIX}-`,
+    "--format",
+    "table {{.Names}}\t{{.Status}}\t{{.CreatedAt}}",
+  ];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would list containers");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
 }
 
 export function getStoppedContainerIds(): string[] {
-  const result = spawnSync(
-    "docker",
-    [
-      "ps",
-      "-a",
-      "--filter",
-      `name=${CONTAINER_PREFIX}-`,
-      "--filter",
-      "status=exited",
-      "--quiet",
-    ],
-    { encoding: "utf8" }
-  );
+  const args = [
+    "ps",
+    "-a",
+    "--filter",
+    `name=${CONTAINER_PREFIX}-`,
+    "--filter",
+    "status=exited",
+    "--quiet",
+  ];
+
+  if (isDryRun()) {
+    logDockerCommand(args);
+    printInfo("[DRY RUN] Would get stopped container IDs");
+    return [];
+  }
+
+  const result = spawnSync("docker", args, { encoding: "utf8" });
 
   const containerIds = result.stdout.trim();
   if (!containerIds) return [];
@@ -298,5 +370,30 @@ export function getStoppedContainerIds(): string[] {
 }
 
 export function removeContainersById(ids: string[]): void {
-  spawnSync("docker", ["rm", ...ids], { stdio: "inherit" });
+  const args = ["rm", ...ids];
+  logDockerCommand(args);
+  if (isDryRun()) {
+    printInfo("[DRY RUN] Would remove containers");
+    return;
+  }
+  spawnSync("docker", args, { stdio: "inherit" });
+}
+
+export function getRunningContainerNames(): string[] {
+  const result = spawnSync(
+    "docker",
+    [
+      "ps",
+      "--filter",
+      `name=${CONTAINER_PREFIX}-`,
+      "--format",
+      "{{.Names}}",
+    ],
+    { encoding: "utf8" }
+  );
+
+  const containerNames = result.stdout.trim();
+  if (!containerNames) return [];
+
+  return containerNames.split("\n");
 }

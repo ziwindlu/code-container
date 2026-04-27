@@ -5,13 +5,14 @@ import {
   buildImage,
   runContainer,
   stopContainerForProject,
+  stopAllContainers,
   removeContainerForProject,
   listContainers,
   cleanContainers,
   init,
 } from "./commands";
 import { checkDocker } from "./docker";
-import { loadSettings, saveSettings } from "./config";
+import { loadSettings, saveSettings, setDryRun } from "./config";
 import { ensureMountsFile } from "./mounts";
 
 const TOS = `
@@ -57,13 +58,16 @@ async function ensureTosAccepted(): Promise<boolean> {
 
 function usage(): void {
   console.log(`
-Usage: container [COMMAND] [PROJECT_PATH] [-- DOCKER_FLAGS...]
+Usage: container [COMMAND] [OPTIONS] [PATH] [-- COMMAND [ARGS...]]
 
 Manage Code containers for isolated project environments.
 
+Global Options:
+    --dry-run, -n   Show commands without executing them
+
 Commands:
     (none)         Start container for current directory (default)
-    run            Start container for specified project path
+    run            Start container with options
     build          Build the Docker image
     init           Copy config files from home directory
     stop           Stop the container for this project
@@ -71,21 +75,56 @@ Commands:
     list           List all Code containers
     clean          Remove all stopped Code containers
 
+Options (run command):
+    -d             Keep container running after exit
+    PATH           Project directory (optional, default: current directory)
+    [docker-flags] Additional flags passed to 'docker run' (e.g., -p, -v, -e)
+
+Config (config.yaml):
+    auto_stop:     Stop container on exit (default: true)
+                   Set to false to keep container running after exit
+                   without needing -d flag each time
+
+Environment Variables:
+    CONTAINER_AUTO_STOP=true/false   Override auto_stop config (highest priority)
+    CONTAINER_BASE_DIR=/path         Override base_dir config
+
 Arguments:
-    PROJECT_PATH    Path to the project directory (defaults to current directory)
-    DOCKER_FLAGS    Additional flags passed to 'docker run' after '--'
+    COMMAND        Command to execute in container (optional, after --)
+    ARGS           Arguments for the command
 
 Examples:
-    container                           # Start container for current directory
-    container run /path/to/project      # Start container for specific project
-    container run /path -- -p 8080:80   # Pass Docker flags for port mapping
-    container run -- -e FOO=bar         # Pass env vars (uses current directory)
+    container                           # Start with bash (current dir)
+    container run                       # Same as above
+    container run -d                    # Keep container running
+    container run /path/to/project      # Start for specific path
+    container run -- ls -la             # Execute 'ls -la' in container
+    container run -- npm install        # Execute 'npm install'
+    container run -d -- npm start       # Run command and keep running
+    container run /path -- python app.py # Run Python script
+    container run -d -p 80:8000 -- npm start  # Port mapping + command
+    container run -d -p 80:8000 $PWD -- ls  # Port mapping + explicit path
+    container run -p 80:8000 -- ls       # Port mapping (current dir)
+    container --dry-run -- ls           # Show commands without executing
+    container -n run -d -p 80:8000      # Dry run with all options
     container build                     # Build Docker image
     container init                      # Copy config files
     container stop                      # Stop container for current directory
+    container stop -a                   # Stop all running containers
     container remove /path/to/project   # Remove container for specific project
     container list                      # List all containers
     container clean                     # Clean up stopped containers
+
+Behavior:
+    - Without -- : Starts interactive bash shell
+    - With -- COMMAND : Executes command and exits (auto-stops unless -d is used)
+    - PATH can be specified before -- or docker flags (default: current directory)
+    - Docker flags like -p, -v, -e are passed directly to docker run
+    - --dry-run/-n : Print docker commands without executing them
+
+Similar to docker run:
+    docker run [OPTIONS] IMAGE [COMMAND]
+    container run [OPTIONS] [PATH] [-- COMMAND]
 `);
   process.exit(0);
 }
@@ -95,8 +134,33 @@ async function main(): Promise<void> {
   let command = "";
   let projectPath = "";
   let cliFlags: string[] = [];
+  let noAutoStop = false;
+  let stopAll = false;
+  let execCommand: string[] = [];
+  let dryRun = false;
 
   if (args.length > 0) {
+    // Check for global --dry-run or -n flag first
+    const dryRunIndex = args.indexOf("--dry-run");
+    const nIndex = args.indexOf("-n");
+    if (dryRunIndex !== -1 || nIndex !== -1) {
+      dryRun = true;
+      setDryRun(true);
+      // Remove dry-run flag from args
+      const argsCopy = [...args];
+      if (dryRunIndex !== -1) {
+        argsCopy.splice(dryRunIndex, 1);
+      }
+      if (nIndex !== -1) {
+        const newNIndex = argsCopy.indexOf("-n");
+        if (newNIndex !== -1) {
+          argsCopy.splice(newNIndex, 1);
+        }
+      }
+      args.length = 0;
+      args.push(...argsCopy);
+    }
+
     const firstArg = args[0];
     if (firstArg === "help" || firstArg === "--help" || firstArg === "-h") {
       usage();
@@ -113,22 +177,81 @@ async function main(): Promise<void> {
     ];
     if (validCommands.includes(firstArg)) {
       command = firstArg;
-      const remainingArgs = args.slice(1);
-      const separatorIndex = remainingArgs.indexOf("--");
-      
-      if (separatorIndex !== -1) {
-        const pathArgs = remainingArgs.slice(0, separatorIndex);
-        if (pathArgs.length > 1) {
-          printError(`Unexpected argument: ${pathArgs[1]}`);
-          usage();
+      let remainingArgs = args.slice(1);
+
+      // Extract -a flag for stop command (first, before other parsing)
+      if (command === "stop") {
+        const aIndex = remainingArgs.indexOf("-a");
+        if (aIndex !== -1) {
+          stopAll = true;
+          remainingArgs = remainingArgs.filter((_, i) => i !== aIndex);
         }
-        projectPath = pathArgs[0] || "";
-        cliFlags = remainingArgs.slice(separatorIndex + 1);
-      } else {
-        projectPath = remainingArgs[0] || "";
-        if (remainingArgs.length > 1) {
-          printError(`Unexpected argument: ${remainingArgs[1]}`);
-          usage();
+      }
+
+      // Parse run command options
+      if (command === "run" || command === "") {
+        const commandSepIndex = remainingArgs.indexOf("--");
+
+        if (commandSepIndex !== -1) {
+          // Has -- separator
+          const optionsPart = remainingArgs.slice(0, commandSepIndex);
+
+          // Extract -d flag
+          const dIndex = optionsPart.indexOf("-d");
+          if (dIndex !== -1) {
+            noAutoStop = true;
+            optionsPart.splice(dIndex, 1);
+          }
+
+          // Extract project path from options (first non-option argument)
+          // Path is the first argument that doesn't start with -
+          for (let i = 0; i < optionsPart.length; i++) {
+            const arg = optionsPart[i];
+            if (arg.startsWith("-")) {
+              // This is an option, skip it and its value if it takes one
+              if (arg === "-p" || arg === "-v" || arg === "-e") {
+                i++; // Skip the option value
+              }
+            } else {
+              // This is the project path
+              projectPath = arg;
+              optionsPart.splice(i, 1);
+              break;
+            }
+          }
+
+          // Remaining options are docker flags
+          cliFlags = optionsPart;
+
+          // Command is after --
+          execCommand = remainingArgs.slice(commandSepIndex + 1);
+        } else {
+          // No -- separator: parse all as options
+          // Extract -d flag
+          const dIndex = remainingArgs.indexOf("-d");
+          if (dIndex !== -1) {
+            noAutoStop = true;
+            remainingArgs.splice(dIndex, 1);
+          }
+
+          // Extract project path from remaining args
+          for (let i = 0; i < remainingArgs.length; i++) {
+            const arg = remainingArgs[i];
+            if (arg.startsWith("-")) {
+              // This is an option, skip it and its value if it takes one
+              if (arg === "-p" || arg === "-v" || arg === "-e") {
+                i++; // Skip the option value
+              }
+            } else {
+              // This is the project path
+              projectPath = arg;
+              remainingArgs.splice(i, 1);
+              break;
+            }
+          }
+
+          // Remaining args are docker flags
+          cliFlags = remainingArgs;
         }
       }
     } else {
@@ -164,14 +287,18 @@ async function main(): Promise<void> {
       buildImage();
       return;
     case "stop":
-      stopContainerForProject(resolvedPath);
+      if (stopAll) {
+        stopAllContainers();
+      } else {
+        stopContainerForProject(resolvedPath);
+      }
       return;
     case "remove":
       removeContainerForProject(resolvedPath);
       return;
     case "run":
     case "":
-      await runContainer(resolvedPath, cliFlags);
+      await runContainer(resolvedPath, cliFlags, noAutoStop, execCommand);
       return;
   }
 }

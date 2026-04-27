@@ -18,19 +18,28 @@ import {
   removeContainer,
   createNewContainer,
   execInteractive,
+  execCommand,
   stopContainerIfLastSession,
   listContainersRaw,
   getStoppedContainerIds,
   removeContainersById,
+  getRunningContainerNames,
   IMAGE_NAME,
   IMAGE_TAG,
 } from "./docker";
 import {
-  ensureConfigDir,
   loadSettings,
   saveSettings,
   copyConfigs,
+  ensureConfigDir as ensureLegacyConfigDir,
 } from "./config";
+import {
+  createDefaultConfig,
+  ensureConfigDir,
+  getConfigDir,
+  copyConfigsFromYaml,
+  loadConfig,
+} from "./config-loader";
 
 export function buildImage(): void {
   printInfo(`Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}`);
@@ -44,12 +53,18 @@ export function buildImage(): void {
 export async function init(isStartup: boolean = false): Promise<void> {
   const settings = loadSettings();
 
+  // Ensure config.yaml exists
+  createDefaultConfig();
+
+  // Get the actual config directory (may be customized)
+  const configDir = getConfigDir();
+
   if (isStartup) {
     // If startup: Check if completedInit, if not, prompt.
     if (!settings.completedInit) {
       printInfo("First run detected. Would you like to copy config files?");
       printInfo(
-        "This will copy your OpenCode, Codex, Claude Code, & Gemini CLI configs to ~/.code-container/configs for mounting."
+        `This will copy your OpenCode, Codex, Claude Code, & Gemini CLI configs to ${configDir}/configs for mounting.`
       );
       printInfo(
         "If you choose to not copy config files, you can still setup your harness once inside the container."
@@ -57,7 +72,7 @@ export async function init(isStartup: boolean = false): Promise<void> {
 
       const shouldCopy = await promptYesNo("Copy config files?");
       if (shouldCopy) {
-        copyConfigs();
+        copyConfigsFromYaml();
         printSuccess("Config files copied successfully");
       } else {
         printInfo("Ignoring copy. Run `container init` to copy.");
@@ -68,8 +83,8 @@ export async function init(isStartup: boolean = false): Promise<void> {
   } else {
     // Else, not startup; user ran container init
     if (!settings.completedInit) {
-      printInfo("Copying config files to ~/.code-container/configs...");
-      copyConfigs();
+      printInfo(`Copying config files to ${configDir}/configs...`);
+      copyConfigsFromYaml();
       printSuccess("Config files copied successfully");
 
       settings.completedInit = true;
@@ -80,14 +95,19 @@ export async function init(isStartup: boolean = false): Promise<void> {
       );
       const shouldCopy = await promptYesNo("Continue?");
       if (shouldCopy) {
-        copyConfigs();
+        copyConfigsFromYaml();
         printSuccess("Config files copied successfully");
       }
     }
   }
 }
 
-export async function runContainer(projectPath: string, cliFlags: string[] = []): Promise<void> {
+export async function runContainer(
+  projectPath: string,
+  cliFlags: string[] = [],
+  noAutoStop: boolean = false,
+  command: string[] = []
+): Promise<void> {
   const containerName = generateContainerName(projectPath);
   const projectName = path.basename(projectPath);
 
@@ -100,6 +120,9 @@ export async function runContainer(projectPath: string, cliFlags: string[] = [])
 
   ensureConfigDir();
 
+  const config = loadConfig();
+  const shouldAutoStop = !noAutoStop && config.auto_stop;
+
   if (!imageExists()) {
     printWarning("Docker image not found. Building...");
     buildImage();
@@ -107,30 +130,65 @@ export async function runContainer(projectPath: string, cliFlags: string[] = [])
 
   if (containerRunning(containerName)) {
     printInfo(`Container '${containerName}' is already running`);
+    if (cliFlags.length > 0) {
+      printWarning(`Docker flags (${cliFlags.join(" ")}) are ignored for existing containers`);
+      printInfo("To apply new flags, remove the container first: container remove " + projectPath);
+    }
     printInfo("Attaching to container...");
-    execInteractive(containerName, projectName);
-    stopContainerIfLastSession(containerName, projectName);
+    if (command.length > 0) {
+      printInfo(`Executing command: ${command.join(" ")}`);
+      execCommand(containerName, projectName, command);
+    } else {
+      printInfo("Starting interactive bash shell");
+      execInteractive(containerName, projectName);
+    }
+    if (shouldAutoStop) {
+      stopContainerIfLastSession(containerName, projectName);
+    }
     return;
   }
 
   if (containerExists(containerName)) {
     printInfo(`Starting existing container: ${containerName}`);
+    if (cliFlags.length > 0) {
+      printWarning(`Docker flags (${cliFlags.join(" ")}) are ignored for existing containers`);
+      printInfo("To apply new flags, remove the container first: container remove " + projectPath);
+    }
     startContainer(containerName);
-    execInteractive(containerName, projectName);
-    stopContainerIfLastSession(containerName, projectName);
+    if (command.length > 0) {
+      printInfo(`Executing command: ${command.join(" ")}`);
+      execCommand(containerName, projectName, command);
+    } else {
+      printInfo("Starting interactive bash shell");
+      execInteractive(containerName, projectName);
+    }
+    if (shouldAutoStop) {
+      stopContainerIfLastSession(containerName, projectName);
+    }
     return;
   }
 
   printInfo(`Creating new container: ${containerName}`);
   printInfo(`Project: ${projectPath}`);
+  if (cliFlags.length > 0) {
+    printInfo(`Docker flags: ${cliFlags.join(" ")}`);
+  }
 
   if (!createNewContainer(containerName, projectName, projectPath, cliFlags)) {
     printError("Failed to create container");
     process.exit(1);
   }
 
-  execInteractive(containerName, projectName);
-  stopContainerIfLastSession(containerName, projectName);
+  if (command.length > 0) {
+    printInfo(`Executing command: ${command.join(" ")}`);
+    execCommand(containerName, projectName, command);
+  } else {
+    printInfo("Starting interactive bash shell");
+    execInteractive(containerName, projectName);
+  }
+  if (shouldAutoStop) {
+    stopContainerIfLastSession(containerName, projectName);
+  }
   printSuccess("Container session ended");
 }
 
@@ -149,6 +207,22 @@ export function stopContainerForProject(projectPath: string): void {
   } else {
     printWarning(`Container is not running: ${containerName}`);
   }
+}
+
+export function stopAllContainers(): void {
+  const runningContainers = getRunningContainerNames();
+
+  if (runningContainers.length === 0) {
+    printInfo("No running Code containers to stop");
+    return;
+  }
+
+  printInfo(`Stopping ${runningContainers.length} container(s)...`);
+  for (const containerName of runningContainers) {
+    printInfo(`Stopping: ${containerName}`);
+    stopContainer(containerName);
+  }
+  printSuccess("All containers stopped");
 }
 
 export function removeContainerForProject(projectPath: string): void {

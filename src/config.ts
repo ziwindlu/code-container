@@ -4,13 +4,16 @@ import * as os from "os";
 import { z } from "zod";
 
 export const APPDATA_DIR = path.join(os.homedir(), ".code-container");
-export const CONFIGS_DIR = path.join(APPDATA_DIR, "configs");
 export const USER_DOCKERFILE_PATH = path.join(APPDATA_DIR, "Dockerfile.User");
 export const SETTINGS_PATH = path.join(APPDATA_DIR, "settings.json");
 export const MOUNTS_PATH = path.join(APPDATA_DIR, "MOUNTS.txt");
 export const FLAGS_PATH = path.join(APPDATA_DIR, "DOCKER_FLAGS.txt");
 export const RUN_FLAGS_PATH = path.join(APPDATA_DIR, "DOCKER_RUN_FLAGS.txt");
 
+// Export getConfigDir from config-loader
+export { getConfigDir, ensureConfigDir as ensureConfigDirWithLoader, createDefaultConfig, getMounts as getMountsFromConfig } from "./config-loader";
+
+// Legacy shared dirs (still used for backwards compatibility)
 export const SHARED_DIRS = [
   ".claude",
   ".codex",
@@ -20,12 +23,30 @@ export const SHARED_DIRS = [
   ".gemini",
 ];
 
+// Get configs directory from config loader
+function getLegacyConfigsDir(): string {
+  return path.join(APPDATA_DIR, "configs");
+}
+
+export const CONFIGS_DIR = getLegacyConfigsDir();
+
 const SettingsSchema = z.object({
   completedInit: z.boolean().default(false),
   acceptedTos: z.boolean().default(false),
 });
 
 export type Settings = z.infer<typeof SettingsSchema>;
+
+// Global dry run flag
+let dryRunMode = false;
+
+export function setDryRun(enabled: boolean): void {
+  dryRunMode = enabled;
+}
+
+export function isDryRun(): boolean {
+  return dryRunMode;
+}
 
 export function ensureAppdataDir(): void {
   if (!fs.existsSync(APPDATA_DIR)) {
